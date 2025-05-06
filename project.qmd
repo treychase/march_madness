@@ -1,0 +1,539 @@
+---
+title: Final Project
+format:
+  html:
+    self-contained: true
+author:
+- Lynn Kremers
+- Katie Solarz
+- Trey Chase
+- Tully Cannon
+---
+
+## Introduction
+
+In this project, we aim to build different models that can predict brackets for the NCAA Men’s Basketball Tournament. Our goal is not just to create a single prediction model, but to experiment with the different modelling approaches of varying complexity that we learned this semester and see which ones perform best. Some models will be fairly simple, while others will use more advanced techniques to try to capture more subtle patterns in the data. The dataset we are using covers data from the seasons 2002 to 2025 and includes a wide range of team statistics, such as average points scored, points allowed, strength of schedule, and other performance metrics. It also includes tournament seedings and game results, giving us a rich base to train and test our models. this project is inspired by the following article: <https://medium.com/>@anthony.klemm/machine-learning-march-madness-2b86cb3e21d2
+
+#### Set up and Data Cleaning:
+
+We start this project by loading all necessary packages as well as the dataset. The original dataset contains 151 columns and 8315 rows. To make this dataset more manageable we decided to focus on only a few of those columns. We decided to follow the approach of Anthony Klemm and only includes the columns "Adjusted Offensive Efficiency", "Adjusted Defensive Efficiency", "eFGPct", "TOPct", "Adjusted Temo", as we think that these have the biggest influence on the outcome of a game. We then also introduced an overall efficiency ratio by dividing the Adjusted Offensive Efficiency by the Adjusted Defensive Efficiency as well as a upset probability. With this upset probability we are trying to identify teams from smaller conferences with strong efficiency metrics. Additionally, we scaled all the features using the `MinMaxScaler()`. Finally, we converted the target variable: 1 if the team made the NCAA Tournament and 0 otherwise.
+
+```{python}
+
+!pip install xgboost
+
+import numpy as np
+import pandas as pd
+
+from sklearn.preprocessing import MinMaxScaler, scale
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss, confusion_matrix, classification_report, roc_curve, ConfusionMatrixDisplay
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, GridSearchCV
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import arviz as az
+import pymc as pm
+import pytensor
+
+```
+
+#### Splitting the dataset:
+
+Once we had a cleaned dataframe to work with we started thinking about what data to use to train the model, and what data to use to test the model. COntrary to the approach of Anthony Klemm who only focused on the 2025 data, we wanted to make use of the historical data as well. Since our idea is to built a model and then evaluate its performance by comparing the predictions to the actual results of the 2025 Tournament we decided to split the data into two dataframes, one containing all the data from 2002- 2024 and one only containing data from 2025.
+
+The idea being, the 2025 Tournament hasn't happened yet and we try to predict whether a team *in 2025* will make the tournament and training the model before the 2025 season started. Then after the 2025 regular season you would use the most up to date statistics to run the model for the predictions.
+
+We then split the 2002 - 2024 dataframe into a test and train dataset that we will use to train the different models and get some basic evaluation metrics.
+
+```{python}
+
+df = pd.read_csv("data/DEV _ March Madness.csv")
+
+## Feature engineering
+df["Normalized Team Name"] = df["Mapped ESPN Team Name"].str.lower().str.strip()
+
+## define overall efficiency ratio
+df["Efficiency_Ratio"] = df["Adjusted Offensive Efficiency"] / df["Adjusted Defensive Efficiency"]
+
+## Define major conferences and upset propensity
+big_conferences = ["ACC", "SEC", "B12"]
+median_eff_ratio = df["Efficiency_Ratio"].median()
+
+def compute_upset_probability(row):
+    if row["Short Conference Name"] not in big_conferences and row["Efficiency_Ratio"] > median_eff_ratio:
+        return 1
+    else:
+        return 0
+
+df["Upset_Probability"] = df.apply(compute_upset_probability, axis=1)
+
+feature_cols = ["Adjusted Offensive Efficiency", "Adjusted Defensive Efficiency",
+                "eFGPct", "TOPct", "Adjusted Temo", "Efficiency_Ratio", "Upset_Probability"]
+
+scaler = MinMaxScaler()
+df[feature_cols] = scaler.fit_transform(df[feature_cols])
+
+## define target variable: 1 if team made "March Madness", else 0.
+df["Made_Tournament"] = (df["Post-Season Tournament"].str.strip() == "March Madness").astype(int)
+
+
+## Split into Train/Test on 2002–2024
+
+model_df = df[df["Season"] < 2025].copy()
+
+X = model_df[feature_cols].values
+y = model_df["Made_Tournament"].values
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.2, random_state = 42)
+
+## Prepare 2025 Data for Interactive Prediction
+
+predict_df = df[df["Season"] == 2025].copy()
+predict_df.set_index("Normalized Team Name", inplace = True)
+```
+
+## Methods / Implementation
+
+#### Logistic Regression:
+
+The first model we chose to use was logistic regression. It is a reasonable model because our outcome variable, `Made_Tournament`, is binary - it indicates whether a team made the tournament or not. We started by training a logistic regression model on the historical training data and evaluated its performance on a separate historical test set. The model showed fairly strong results, achieving an accuracy of 0.8994, a ROC AUC of 0.9134, and a log loss of 0.2748.
+
+However, predicting tournament qualification alone is not our final goal. Instead, we want to predict the winners of individual matchups. To close this gap, we use the model’s predicted probabilities — the likelihood that each team would qualify for the tournament — as a proxy for team strength. To make this practical, we developed an interactive head-to-head matchup prediction function that can be used to build a hypothetical bracket. For any given matchup, the model estimates the qualification probabilities for both teams based on their 2025 season statistics. We then compare these probabilities directly: the team with the higher relative probability is predicted to win. This approach allows us to simulate matchups using a data-driven measure of team strength, rather than relying on traditional win-loss records, seedings, or subjective rankings. (this code chunk does not get evaluated in the qmd for rendering purposes)
+
+```{python}
+## Fitting logistic Regression Model
+
+log_reg = LogisticRegression(max_iter = 200)
+log_reg.fit(X_train, y_train)
+
+
+## Evaluation of model
+
+y_pred_prob = log_reg.predict_proba(X_test)[:, 1]
+y_pred = (y_pred_prob >= 0.5).astype(int)
+
+accuracy = accuracy_score(y_test, y_pred)
+auc = roc_auc_score(y_test, y_pred_prob)
+logloss = log_loss(y_test, y_pred_prob)
+
+print("\nModel Evaluation on 2002–2024 Data (Holdout Test Set):")
+print(f"Accuracy:  {accuracy:.4f}")
+print(f"ROC AUC:   {auc:.4f}")
+print(f"Log Loss:  {logloss:.4f}")
+
+## Confusion matrix
+cm = confusion_matrix(y_test, y_pred)
+print("\nConfusion Matrix:")
+print(cm)
+
+plt.figure(figsize=(7, 5))
+sns.heatmap(cm, annot = True, fmt = "d", cmap = "Blues", cbar = False)
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("Confusion Matrix")
+plt.show()
+
+## ROC curve
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_prob)
+
+plt.figure(figsize=(7, 5))
+plt.plot(fpr, tpr, label = f"ROC curve (AUC = {auc:.2f})")
+plt.plot([0, 1], [0, 1], 'k--', label = "Random Guess")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate (Recall)")
+plt.title("ROC Curve")
+plt.legend(loc = "lower right")
+plt.grid()
+plt.show()
+
+## Classification report
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred))
+```
+
+```{python}
+#| eval: false
+
+## Interactive Head-to-Head Matchup Predictions
+
+print("\nModel is ready for head-to-head predictions using 2025 season data!")
+print("Type 'quit' at any time to exit.")
+
+def predict_matchup_lr(team_A_name, team_B_name, model, data, feature_cols):
+    team_A_norm = team_A_name.strip().lower()
+    team_B_norm = team_B_name.strip().lower()
+
+    try:
+        team_A_features = data.loc[[team_A_norm], feature_cols].values
+        team_B_features = data.loc[[team_B_norm], feature_cols].values
+    except KeyError:
+        raise ValueError("One or both team names not found in the 2025 data.")
+
+    prob_A = model.predict_proba(team_A_features)[0][1]
+    prob_B = model.predict_proba(team_B_features)[0][1]
+
+    win_probability_A = prob_A / (prob_A + prob_B)
+    print(f"\n{team_A_name} win probability: {win_probability_A:.4f}", flush = True)
+    print(f"{team_B_name} win probability: {1 - win_probability_A:.4f}", flush = True)
+
+    return team_A_name if win_probability_A >= 0.5 else team_B_name
+
+while True:
+    team_A_input = input("\nEnter the name of Team A (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_A_input.lower() == "quit":
+        break
+    team_B_input = input("Enter the name of Team B (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_B_input.lower() == "quit":
+        break
+    try:
+        winner = predict_matchup_lr(team_A_input, team_B_input, log_reg, predict_df, feature_cols)
+        print("Predicted Winner:", winner, flush = True)
+    except ValueError as e:
+        print("Error:", e, flush = True)
+```
+
+After building a bracket by running predictions for all matchups, we compared our predicted bracket to the actual tournament results. Out of the 63 games played, only 10 were incorrectly predicted. Five of the wrong predictions occurred in the first round, three in the second round, and the remaining two were a semifinal and the final game. Overall, the model performed fairly well, but it struggled to predict the few major upsets that happened during the tournament and benefited from the fact that there were no major Cinderella runs in this year’s tournament. Most of the expected favorites advanced, which played to the model’s strengths. Based on these results, our next step is to develop a model that is more adaptive and better able to account for unexpected outcomes.
+
+#### Boosting Model:
+
+The second model we implemented was a classification boosting model, using the 'xgboost' package. It is a step up in complexity compared to the logistic regression model and is known to have superior predictive power among the most prominent models. The model employs gridsearch and 5-fold cross validation to find the optimal parameters for this model, and then returns a summary of accuracy metrics and plots to report.
+
+```{python}
+import xgboost as xgb
+## Create and train the XGBoost model
+xgb_model = xgb.XGBClassifier(
+    objective = 'binary:logistic',
+    n_estimators = 100,
+    learning_rate = 0.05,
+    max_depth = 4,
+    min_child_weight = 2,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    random_state = 42
+)
+
+## Define parameter grid for hyperparameter tuning
+param_grid = {
+    'n_estimators': [50, 100, 150],
+    'max_depth': [3, 4, 5],
+    'learning_rate': [0.01, 0.05, 0.1]
+}
+
+## Perform grid search with cross-validation
+grid_search = GridSearchCV(
+    estimator = xgb_model,
+    param_grid = param_grid,
+    cv = 5,
+    scoring = 'roc_auc',
+    verbose = 0
+)
+
+grid_search.fit(X_train, y_train)
+
+## Store the best model
+best_xgb_model = grid_search.best_estimator_
+
+print("Best parameters:", grid_search.best_params_)
+
+## Evaluation of model
+y_pred_prob = best_xgb_model.predict_proba(X_test)[:, 1]
+y_pred = (y_pred_prob >= 0.5).astype(int)
+
+print("\nModel Evaluation on 2002–2024 Data (Holdout Test Set):")
+print(f"Accuracy:  {accuracy_score(y_test, y_pred):.4f}")
+print(f"ROC AUC:   {roc_auc_score(y_test, y_pred_prob):.4f}")
+print(f"Log Loss:  {log_loss(y_test, y_pred_prob):.4f}")
+
+## Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(8, 6))
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['0', '1'])
+disp.plot(cmap = plt.cm.Blues, values_format='d')
+plt.title('Confusion Matrix')
+plt.grid(False)
+plt.tight_layout()
+plt.show()
+
+## Calculate additional metrics from confusion matrix
+tn, fp, fn, tp = cm.ravel()
+precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+print(f"\nPrecision: {precision:.4f}")
+print(f"Recall:    {recall:.4f}")
+print(f"F1 Score:  {f1:.4f}")
+
+## Store ROC/AUC variables for plotting
+roc_auc = roc_auc_score(y_test, y_pred_prob)
+
+## ROC Curve 
+plt.figure(figsize=(8, 6))
+fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+plt.plot(fpr, tpr, color='blue', lw=2, 
+         label=f'ROC curve (area = {roc_auc:.4f})')
+plt.plot([0, 1], [0, 1], color='gray', lw = 1, linestyle = '--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend(loc="lower right")
+plt.grid(True, alpha = 0.3)
+plt.tight_layout()
+plt.show()
+
+```
+
+```{python}
+#| eval: false
+
+## Interactive Head-to-Head Matchup Predictions for XGBoost
+print("\nModel is ready for head-to-head predictions using 2025 season data!")
+print("Type 'quit' at any time to exit.")
+
+def predict_matchup_xgb(team_A_name, team_B_name, model, data, feature_cols):
+    team_A_norm = team_A_name.strip().lower()
+    team_B_norm = team_B_name.strip().lower()
+    
+    try:
+        team_A_features = data.loc[[team_A_norm], feature_cols].values
+        team_B_features = data.loc[[team_B_norm], feature_cols].values
+    except KeyError:
+        raise ValueError("One or both team names not found in the 2025 data.")
+    
+    # Get probability predictions from the XGBoost model
+    prob_A = model.predict_proba(team_A_features)[0][1]
+    prob_B = model.predict_proba(team_B_features)[0][1]
+    
+    win_probability_A = prob_A / (prob_A + prob_B)
+    print(f"\n{team_A_name} win probability: {win_probability_A:.4f}", flush = True)
+    print(f"{team_B_name} win probability: {1 - win_probability_A:.4f}", flush = True)
+    
+    return team_A_name if win_probability_A >= 0.5 else team_B_name
+
+while True:
+    team_A_input = input("\nEnter the name of Team A (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_A_input.lower() == "quit":
+        break
+    team_B_input = input("Enter the name of Team B (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_B_input.lower() == "quit":
+        break
+    
+    try:
+        winner = predict_matchup_xgb(team_A_input, team_B_input, best_xgb_model, predict_df, feature_cols)
+        print("Predicted Winner:", winner, flush = True)
+    except ValueError as e:
+        print("Error:", e, flush = True)
+```
+
+The code block above mirrors that of the logistic regression code that simulates a bracket with user input. The notable change is that the predictions are now generated with the boosting model. The win probabilities do differ with the boosting model, for example Houston beats Duke head to head while Duke beats Houston with the previous model. The difference is quite marginal, reflecting the similarity.
+
+Based on the output, the boosting model and logistic regression model perform closely. If computation cost was a factor, I would recommend using the logistic model for its interpretability and simplicity. The gridsearch and cross validation could be expanded if there is more budget for computation and higher accuracy is needed. However, in a tournament setting where there is a lot of variance in the outcome, these metrics are satisfactory.
+
+To assess how well this model performed we, again, simulated a full bracket and compared it to the actual results. Out of the 63 games only 43 winners were correctly predicted. Important to note is that only two of the final four teams were correctly predicted (Duke and Houston), however it did predict Houstons win over Duke correctly. It seems like, in contrast to the logistic regression model, this model suffered from overestimating the upset probability and the missing cinderella runs this year (e.g. it predicted Maryland - ranked 4th in their Region - to advance to the Final Four).
+
+#### Bayesian Neural Network:
+
+For our third and final model, we chose to implement a Bayesian Neural Network (BNN) model using Variational Inference in PyMC. We thought this would be an interesting model to explore given the time spent on various types of NN models and Bayesian models throughout the course. The project outlined on [this page](https://www.pymc.io/projects/examples/en/latest/variational_inference/bayesian_neural_network_advi.html) was used as a reference for implementing the BNN model below.
+
+The `construct_nn` function takes input features `X_train` and target labels `Y_train`, along with an optional `batch_size` and a boolean flag `minibatch_mode` to enable / disable mini-batch training. Weight matrices between each layer are initialized from a standard normal distribution and stored as `init_1`, `init_2`, and `init_out`. If `minibatch_mode` is enabled, `X_train` and `Y_train` are wrapped in a mini-batch generator; otherwise, the full dataset is used directly. Each of the three weights are given normal priors with mean 0 and standard deviation 0.5; normal priors are chosen to help regularize the weights. Internally, the network has two hidden layers (3 neurons each) with tanh activation functions, and a final output layer with a sigmoid activation, which is generally appropriate for binary classification. This output is then passed into a Bernoulli likelihood, conditioned on the observed labels `Y_train`. Finally, the function returns the constructed model object for later use in inference / prediction tasks.
+
+Due to the architechture of our BNN model, we found that the PyMC NUTS sampler was highly inefficient, even with fewer than 4 chains. Instead, the model is constructed on the training data (`X_train`, `y_train`) with minibatching enabled and fit using Automatic Differentiation Variational Inference (ADVI), which minimizes the negative Evidence Lower Bound (ELBO) over 30,000 iterations. Note that minimizing the negative ELBO is effectively minimizing the the Kullback–Leibler (KL) divergence between the true posterior and our variational approximation. In plotting the negative ELBO, we find that our ADVI algorithm has appropriately converged. After fitting, a posterior approximation is sampled to produce a trace with 5,000 draws representing the approximate posterior over the model parameters. A trace summary and corresponding trace plots of model parameters are generated using ArviZ; all plots are suggestive of successful convergence to the posterior.
+
+Next, we construct a model on our test set (`X_test`, `y_test`) with `minibatch_mode` disabled (given the relatively small size of test data). Using the previously drawn posterior, stored as `trace`, the model performs posterior predictive sampling to produce a distribution of predictions for each test point. The posterior predictive mean is computed for each test point to estimate class probabilities; a threshold of .5 is used to generate predicted class labels (binary) from these probabilities. The predictions are evaluated against the true test labels with traditional measures (i.e. accuracy, ROC / AUC, confusion matrix). Overall, our BNN model offers roughly 85% accuracy. We do acknowledge that there are significantly more "failures" (not making the tournament) than "successes" (making the tournament) in this dataset, and we see the implications of this imbalance in the fact that our model's recall for class 1 ("success") is only \~32%, despite high overall accuracy. Future iterations of this model could explore using a weighted likelihood function to improve class 1 recall.
+
+Finally, we implement an interactive prediction tool that allows users to compare two teams head-to-head using the BNN model. The core function, `predict_matchup_bnn`, accepts two team names and uses the provided posterior trace and model-building function to compute the posterior predictive win probabilities for each team. For each team, a lightweight model is constructed using `construct_nn` in non-minibatch mode. Posterior predictive samples are drawn, and the mean predicted win probability is computed from the samples. These probabilities are then normalized to provide a head-to-head win probability comparison. The function prints and returns the predicted winner based on which team has a higher normalized posterior mean probability.
+
+```{python}
+#| warning: False
+
+floatX = pytensor.config.floatX
+random_seed = 123
+rng = np.random.default_rng(random_seed)
+
+
+def construct_nn(X_train, Y_train, batch_size = 50, minibatch_mode = True):
+    n_hidden = 3
+
+    # Initialize random weights between each layer
+    init_1 = rng.standard_normal(size = (X_train.shape[1], n_hidden)).astype(floatX)
+    init_2 = rng.standard_normal(size = (n_hidden, n_hidden)).astype(floatX)
+    init_out = rng.standard_normal(size = n_hidden).astype(floatX)
+
+    coords = {
+        "hidden_layer_1": np.arange(n_hidden),
+        "hidden_layer_2": np.arange(n_hidden),
+        "train_cols": np.arange(X_train.shape[1]),
+        "obs_id": np.arange(X_train.shape[0]),
+    }
+
+    with pm.Model(coords = coords) as neural_network:
+        X_data = pm.Data("X_data", X_train, dims = ("obs_id", "train_cols"))
+        Y_data = pm.Data("Y_data", Y_train, dims = "obs_id")
+
+        if minibatch_mode:
+            ann_input, ann_output = pm.Minibatch(X_data, Y_data, batch_size = batch_size)
+        else:
+            ann_input = X_data
+            ann_output = Y_data
+
+        # Place weakly informative priors on weights
+        weights_in_1 = pm.Normal("w_in_1", 0, sigma = 0.5, initval = init_1, dims = ("train_cols", "hidden_layer_1"))
+        weights_1_2 = pm.Normal("w_1_2", 0, sigma = 0.5, initval = init_2, dims = ("hidden_layer_1", "hidden_layer_2"))
+        weights_2_out = pm.Normal("w_2_out", 0, sigma = 0.5, initval = init_out, dims = "hidden_layer_2")
+
+        # Neural network forward pass
+        act_1 = pm.math.tanh(pm.math.dot(ann_input, weights_in_1))
+        act_2 = pm.math.tanh(pm.math.dot(act_1, weights_1_2))
+        act_out = pm.math.sigmoid(pm.math.dot(act_2, weights_2_out))
+
+        # Set size depending on minibatch flag
+        total_size = X_train.shape[0] if minibatch_mode else None
+
+        # Output likelihood
+        out = pm.Bernoulli("out", act_out, observed = ann_output, total_size = total_size)
+
+    return neural_network
+
+## Train the BNN model on 2002 - 2024 training data
+neural_network = construct_nn(X_train, y_train, minibatch_mode = True)
+
+with neural_network:
+    approx = pm.fit(n = 30000)
+
+plt.clf()  
+plt.plot(approx.hist, alpha = 0.3)
+plt.ylabel("Negative ELBO")
+plt.xlabel("iteration")
+plt.show()
+    
+trace = approx.sample(draws = 5000)
+
+az.summary(trace)
+ax = az.plot_trace(trace)
+plt.show()
+
+## Test the BNN model on 2002 - 2024 testing data
+neural_network_predict = construct_nn(X_test, y_test, minibatch_mode = False)
+
+with neural_network_predict:
+    ppc = pm.sample_posterior_predictive(trace, var_names = ["out"], random_seed = random_seed)
+
+## Remove chain dimension
+y_pred_samples = np.squeeze(ppc.posterior_predictive["out"].values)
+
+y_pred_proba = y_pred_samples.mean(axis=0)
+y_pred_class = (y_pred_proba >= 0.5).astype(int)
+y_test_flat = y_test.flatten()
+
+## Compute accuracy
+acc = accuracy_score(y_test_flat, y_pred_class)
+print(f"Accuracy: {acc:.4f}")
+
+## Confusion matrix
+cm = confusion_matrix(y_test_flat, y_pred_class)
+print("\nConfusion Matrix:")
+print(cm)
+
+plt.figure(figsize=(7, 5))
+sns.heatmap(cm, annot = True, fmt = "d", cmap = "Blues", cbar = False)
+plt.xlabel("Predicted Label")
+plt.ylabel("True Label")
+plt.title("Confusion Matrix")
+plt.show()
+
+## Plot ROC; compute AUC score
+fpr, tpr, thresholds = roc_curve(y_test.flatten(), y_pred_proba)
+auc = roc_auc_score(y_test_flat, y_pred_proba)
+print(f"\nROC AUC Score: {auc:.4f}")
+
+plt.figure(figsize=(7, 5))
+plt.plot(fpr, tpr, label=f"ROC curve (AUC = {auc:.2f})")
+plt.plot([0, 1], [0, 1], 'k--', label = "Random Guess")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate (Recall)")
+plt.title("ROC Curve")
+plt.legend(loc="lower right")
+plt.grid()
+plt.show()
+
+## Classification report
+print("\nClassification Report:")
+print(classification_report(y_test_flat, y_pred_class))
+
+```
+
+```{python}
+#| eval: false
+
+## Construct interactive prediction model for 2025 matchups 
+def predict_matchup_bnn(team_A_name, team_B_name, trace, data, feature_cols, model_constructor):
+    team_A_norm = team_A_name.strip().lower()
+    team_B_norm = team_B_name.strip().lower()
+
+    try:
+        team_A_features = data.loc[[team_A_norm], feature_cols].values
+        team_B_features = data.loc[[team_B_norm], feature_cols].values
+    except KeyError:
+        raise ValueError("One or both team names not found in the 2025 data.")
+
+    # Build the prediction model for Team A
+    nn_A = model_constructor(team_A_features, np.ones(team_A_features.shape[0]), minibatch_mode = False)
+    with nn_A:
+        ppc_A = pm.sample_posterior_predictive(trace, var_names = ["out"], random_seed = random_seed)
+    y_pred_samples_A = np.squeeze(ppc_A.posterior_predictive["out"].values)
+    prob_A = y_pred_samples_A.mean()
+
+    # Build the prediction model for Team B
+    nn_B = model_constructor(team_B_features, np.ones(team_B_features.shape[0]), minibatch_mode = False)
+    with nn_B:
+        ppc_B = pm.sample_posterior_predictive(trace, var_names = ["out"], random_seed = random_seed)
+    y_pred_samples_B = np.squeeze(ppc_B.posterior_predictive["out"].values)
+    prob_B = y_pred_samples_B.mean()
+    print("B mean prob:", prob_A)
+
+    # Normalize probabilities
+    win_probability_A = prob_A / (prob_A + prob_B)
+
+    print(f"\n{team_A_name} win probability: {win_probability_A:.4f}", flush = True)
+    print(f"{team_B_name} win probability: {1 - win_probability_A:.4f}", flush = True)
+
+    return team_A_name if win_probability_A >= 0.5 else team_B_name
+
+print("\nBNN model is ready for head-to-head predictions using 2025 season data!")
+print("Type 'quit' at any time to exit.")
+
+while True:
+    team_A_input = input("\nEnter the name of Team A (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_A_input.lower() == "quit":
+        break
+    team_B_input = input("Enter the name of Team B (as in 'Mapped ESPN Team Name'): ").strip()
+    if team_B_input.lower() == "quit":
+        break
+    try:
+        winner = predict_matchup_bnn(
+            team_A_input,
+            team_B_input,
+            trace,
+            predict_df,
+            feature_cols,
+            construct_nn  
+        )
+        print("Predicted Winner:", winner, flush = True)
+    except ValueError as e:
+        print("Error:", e, flush = True)
+```
+
+To assess how well this model would have performed as a "bracket builder", we ran all match-ups that actually took place in the 2025 NCAA tournament and compared the predictions of the BNN model to the actual tournament results. Out of the 63 games played, 15 were incorrectly predicted. A majority of the incorrect predictions took place in the first round; notably, the BNN model incorrectly predicted the winner of the NCAA Championship game (selected Houston over Florida). The BNN model did, however, correctly predict the rather unfortunate result of the Houston - Duke Final Four game.
+
+## Discussion & Conclusions
+
+Across all three models, the logistic regression model performed the best as a bracket predictor, with only 10 incorrect predictions out of the 63 games. Its more conservative predictions aligned well with the 2025 tournament’s relatively predictable outcomes, where most top seeds advanced. In contrast, the boosting model appeared to overestimate upset probabilities, leading to more aggressive and ultimately inaccurate predictions, including unexpected Final Four picks. The Bayesian neural network fell somewhere in between, capturing some high-profile matchups like Houston vs. Duke correctly but struggling with early-round results. Overall, while the more complex models introduced more flexibility, the simpler logistic regression model proved most effective in a year with few surprises.
+
+Looking ahead, it would be interesting to see how each model performs in tournament years with more upsets or unexpected runs, as 2025 was relatively stable in terms of outcomes. Evaluating the models on past seasons with more variability could reveal strengths or limitations that weren’t apparent this year.
+
+Additionally, a key next step is to automate the current manual matchup process, allowing us to generate full bracket predictions directly from seedings and team lists. This would make the workflow more efficient and scalable, especially when simulating multiple tournament scenarios.
